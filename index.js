@@ -3,15 +3,17 @@ import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import twilio from 'twilio';
+import fastifyCors from '@fastify/cors';
 
 // Load environment variables from .env file
 dotenv.config();
 
-// Retrieve the OpenAI API key from environment variables.
-const { OPENAI_API_KEY } = process.env;
+// Retrieve Twilio and OpenAI API keys from environment variables
+const { DOMAIN, OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, DESTINATION_PHONE_NUMBER } = process.env;
 
-if (!OPENAI_API_KEY) {
-    console.error('Missing OpenAI API key. Please set it in the .env file.');
+if (!DOMAIN || !OPENAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER || !DESTINATION_PHONE_NUMBER) {
+    console.error('Missing environment variables. Please set them in the .env file.');
     process.exit(1);
 }
 
@@ -20,8 +22,18 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
+// Register CORS plugin
+fastify.register(fastifyCors, {
+  origin: ['http://localhost:3000'], // Add your frontend origin(s) here
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true,
+});
+
+// Initialize Twilio Client
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
 // Constants
-const SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts. You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. Always stay positive, but work in a joke when appropriate.';
+const SYSTEM_MESSAGE = 'Eres el asistente virtual de Gonzalo, especializado en negociaciones financieras, encargado de llamar a una "cueva" para negociar el cambio de USDC a ARS. Tu misión es obtener la mejor tasa de cambio posible, idealmente menos de 900 ARS por 1 USDC. Mantén un tono profesional y respetuoso, pero presiona suavemente para mejorar la tasa si es necesario. Confirma todos los detalles de la transacción y, si la tasa es aceptable, cierra el trato con cortesía y eficiencia. Evita charlas innecesarias y mantén el enfoque en la negociación. Empieza la llamada con un saludo y una introducción clara y concisa.';
 const VOICE = 'alloy';
 const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
 
@@ -45,16 +57,28 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// Route for Twilio to handle incoming calls
-// <Say> punctuation to improve text-to-speech translation
-fastify.all('/incoming-call', async (request, reply) => {
+// Route to initiate outbound call
+fastify.post('/call', async (request, reply) => {
+    try {
+        const call = await twilioClient.calls.create({
+            url: `https://${DOMAIN}/twilio-voice`,  // Webhook for Twilio to fetch instructions
+            to: DESTINATION_PHONE_NUMBER,
+            from: TWILIO_PHONE_NUMBER,
+        });
+
+        reply.send({ success: true, message: `Call initiated with SID: ${call.sid}` });
+    } catch (error) {
+        console.error('Error initiating call:', error);
+        reply.status(500).send({ success: false, message: 'Failed to initiate call.' });
+    }
+});
+
+// Webhook to handle the Twilio call and connect the AI voice assistant
+fastify.all('/twilio-voice', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                           <Response>
-                              <Say>Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open-A.I. Realtime API</Say>
-                              <Pause length="1"/>
-                              <Say>O.K. you can start talking!</Say>
                               <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream" />
+                                  <Stream url="wss://${DOMAIN}/media-stream" />
                               </Connect>
                           </Response>`;
 
@@ -72,6 +96,7 @@ fastify.register(async (fastify) => {
         let lastAssistantItem = null;
         let markQueue = [];
         let responseStartTimestampTwilio = null;
+        const seen = new Set();
 
         const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
             headers: {
@@ -177,7 +202,16 @@ fastify.register(async (fastify) => {
                 const response = JSON.parse(data);
 
                 if (LOG_EVENT_TYPES.includes(response.type)) {
-                    console.log(`Received event: ${response.type}`, response);
+                    console.log(`Received event: ${response.type}`, JSON.stringify(response, (key, value) => {
+                        if (typeof value === 'object' && value !== null) {
+                            if (seen.has(value)) {
+                                return '[Circular]';
+                            }
+                            seen.add(value);
+                        }
+                        return value;
+                    }, 2));
+                    seen.clear(); // Clear the Set after logging
                 }
 
                 if (response.type === 'response.audio.delta' && response.delta) {
